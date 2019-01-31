@@ -1,5 +1,6 @@
-import { ContractSource, Resolver } from '@0x/sol-resolver';
 import { fetchAsync, logUtils } from '@0x/utils';
+import { ResolverEngine } from '@resolver-engine/core';
+import { ImportFile } from '@resolver-engine/imports';
 import chalk from 'chalk';
 import { ContractArtifact } from 'ethereum-types';
 import * as ethUtil from 'ethereumjs-util';
@@ -88,12 +89,13 @@ export function getNormalizedErrMsg(errMsg: string): string {
     return normalizedErrMsg;
 }
 
+// TODO consider replacing parseDependencies() with resolver-engine's findImports()
 /**
  * Parses the contract source code and extracts the dendencies
  * @param  source Contract source code
  * @return List of dependendencies
  */
-export function parseDependencies(contractSource: ContractSource): string[] {
+export function parseDependencies(contractSource: ImportFile): string[] {
     // TODO: Use a proper parser
     const source = contractSource.source;
     const IMPORT_REGEX = /(import\s)/;
@@ -106,7 +108,7 @@ export function parseDependencies(contractSource: ContractSource): string[] {
             if (!_.isNull(dependencyMatch)) {
                 let dependencyPath = dependencyMatch[1];
                 if (dependencyPath.startsWith('.')) {
-                    dependencyPath = path.join(path.dirname(contractSource.path), dependencyPath);
+                    dependencyPath = path.join(path.dirname(contractSource.url), dependencyPath);
                 }
                 dependencies.push(dependencyPath);
             }
@@ -117,19 +119,13 @@ export function parseDependencies(contractSource: ContractSource): string[] {
 
 /**
  * Compiles the contracts and prints errors/warnings
- * @param resolver Resolver
  * @param solcInstance Instance of a solc compiler
  * @param standardInput Solidity standard JSON input
  */
-export function compile(
-    resolver: Resolver,
-    solcInstance: solc.SolcInstance,
-    standardInput: solc.StandardInput,
-): solc.StandardOutput {
+export function compile(solcInstance: solc.SolcInstance, standardInput: solc.StandardInput): solc.StandardOutput {
     const standardInputStr = JSON.stringify(standardInput);
     const standardOutputStr = solcInstance.compileStandardWrapper(standardInputStr, importPath => {
-        const sourceCodeIfExists = resolver.resolve(importPath);
-        return { contents: sourceCodeIfExists.source };
+        throw new Error('Used callback. All sources should be resolved beforehand.');
     });
     const compiled: solc.StandardOutput = JSON.parse(standardOutputStr);
     if (!_.isUndefined(compiled.errors)) {
@@ -163,15 +159,18 @@ function printCompilationErrorsAndWarnings(solcErrors: solc.SolcError[]): void {
  * Gets the source tree hash for a file and its dependencies.
  * @param fileName Name of contract file.
  */
-export function getSourceTreeHash(resolver: Resolver, importPath: string): Buffer {
-    const contractSource = resolver.resolve(importPath);
-    const dependencies = parseDependencies(contractSource);
-    const sourceHash = ethUtil.sha3(contractSource.source);
+export async function getSourceTreeHashAsync(
+    resolver: ResolverEngine<ImportFile>,
+    importPath: string,
+): Promise<Buffer> {
+    const importFile: ImportFile = await resolver.require(importPath);
+    const dependencies = parseDependencies(importFile);
+    const sourceHash = ethUtil.sha3(importFile.source);
     if (dependencies.length === 0) {
         return sourceHash;
     } else {
-        const dependencySourceTreeHashes = _.map(dependencies, (dependency: string) =>
-            getSourceTreeHash(resolver, dependency),
+        const dependencySourceTreeHashes = await Promise.all(
+            _.map(dependencies, async (dependency: string) => getSourceTreeHashAsync(resolver, dependency)),
         );
         const sourceTreeHashesBuffer = Buffer.concat([sourceHash, ...dependencySourceTreeHashes]);
         const sourceTreeHash = ethUtil.sha3(sourceTreeHashesBuffer);
@@ -187,14 +186,15 @@ export function getSourceTreeHash(resolver: Resolver, importPath: string): Buffe
  * taken from the corresponding ID's in @param fullSources, and the content for @return sourceCodes is read from
  * disk (via the aforementioned `resolver.source`).
  */
-export function getSourcesWithDependencies(
-    resolver: Resolver,
+export async function getSourcesWithDependenciesAsync(
+    resolver: ResolverEngine<ImportFile>,
     contractPath: string,
     fullSources: { [sourceName: string]: { id: number } },
-): { sourceCodes: { [sourceName: string]: string }; sources: { [sourceName: string]: { id: number } } } {
+): Promise<{ sourceCodes: { [sourceName: string]: string }; sources: { [sourceName: string]: { id: number } } }> {
     const sources = { [contractPath]: { id: fullSources[contractPath].id } };
-    const sourceCodes = { [contractPath]: resolver.resolve(contractPath).source };
-    recursivelyGatherDependencySources(
+    const pamparampam = await resolver.require(contractPath);
+    const sourceCodes = { [contractPath]: pamparampam.source };
+    await recursivelyGatherDependencySourcesAsync(
         resolver,
         contractPath,
         sourceCodes[contractPath],
@@ -205,14 +205,14 @@ export function getSourcesWithDependencies(
     return { sourceCodes, sources };
 }
 
-function recursivelyGatherDependencySources(
-    resolver: Resolver,
+async function recursivelyGatherDependencySourcesAsync(
+    resolver: ResolverEngine<ImportFile>,
     contractPath: string,
     contractSource: string,
     fullSources: { [sourceName: string]: { id: number } },
     sourcesToAppendTo: { [sourceName: string]: { id: number } },
     sourceCodesToAppendTo: { [sourceName: string]: string },
-): void {
+): Promise<void> {
     const importStatementMatches = contractSource.match(/\nimport[^;]*;/g);
     if (importStatementMatches === null) {
         return;
@@ -247,17 +247,24 @@ function recursivelyGatherDependencySources(
              * while others are absolute ("Token.sol", "@0x/contracts/Wallet.sol")
              * And we need to append the base path for relative imports.
              */
-            importPath = path.resolve(`/${contractFolder}`, importPath).replace('/', '');
+            importPath = path.resolve(`/${contractFolder}`, importPath);
+
+            // NOTE we want to remove leading slash ONLY if the path to contract
+            // folder is not an absolute path (e.g. path to npm package)
+            if (!contractFolder.startsWith('/')) {
+                importPath = importPath.replace('/', '');
+            }
         }
 
         if (_.isUndefined(sourcesToAppendTo[importPath])) {
             sourcesToAppendTo[importPath] = { id: fullSources[importPath].id };
-            sourceCodesToAppendTo[importPath] = resolver.resolve(importPath).source;
+            const importFile = await resolver.require(importPath);
+            sourceCodesToAppendTo[importPath] = importFile.source;
 
-            recursivelyGatherDependencySources(
+            await recursivelyGatherDependencySourcesAsync(
                 resolver,
                 importPath,
-                resolver.resolve(importPath).source,
+                importFile.source,
                 fullSources,
                 sourcesToAppendTo,
                 sourceCodesToAppendTo,
